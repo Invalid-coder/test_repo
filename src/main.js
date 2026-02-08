@@ -305,7 +305,10 @@ function initWorker() {
     state.worker.postMessage({ type: 'INIT', payload: { modelPath: absoluteModelPath } });
 }
 
-// --- RENDERER CALLBACK ---
+/**
+ * INTEGRATED: Linear Interpolation Version
+ * Smoothes 30FPS data to match high-refresh rate displays (60/120Hz)
+ */
 function getExpressionCallback() {
     if (state.audioPlaying) {
         let currentTime = 0;
@@ -316,19 +319,41 @@ function getExpressionCallback() {
              if (audioEl) currentTime = audioEl.currentTime;
         }
 
-        const targetFrameIdx = Math.floor((currentTime + CONFIG.syncOffset) * CONFIG.fps);
+        // Calculate precise fractional index
+        const preciseIdx = (currentTime + CONFIG.syncOffset) * CONFIG.fps;
+        const indexA = Math.floor(preciseIdx);
+        const fraction = preciseIdx - indexA;
 
-        if (targetFrameIdx >= 0) {
-            if (targetFrameIdx < state.animationBuffer.length) {
-                const weights = state.animationBuffer[targetFrameIdx];
+        if (indexA >= 0) {
+            // Case 1: We have both current and next frame (Interpolate)
+            if (indexA < state.animationBuffer.length - 1) {
+                const weightsA = state.animationBuffer[indexA];
+                const weightsB = state.animationBuffer[indexA + 1];
+                const bs = {};
+
+                BLENDSHAPE_NAMES.forEach((name, i) => {
+                    // Linear Interpolation: A * (1-t) + B * t
+                    bs[name] = weightsA[i] * (1 - fraction) + weightsB[i] * fraction;
+                });
+
+                updateDebug(bs["jawOpen"], state.animationBuffer.length - indexA);
+                return bs;
+            }
+            // Case 2: We only have the current frame (Last frame available)
+            // This occurs at the very end of the buffer or during high-latency events
+            else if (indexA < state.animationBuffer.length) {
+                const weights = state.animationBuffer[indexA];
                 const bs = {};
                 BLENDSHAPE_NAMES.forEach((name, i) => bs[name] = weights[i]);
-                updateDebug(weights[24], state.animationBuffer.length - targetFrameIdx);
+                updateDebug(weights[24], state.animationBuffer.length - indexA);
                 return bs;
-            } else if (state.animationBuffer.length > 0) {
+            }
+            // Case 3: Buffer exhausted - Hold the literal last frame to prevent "reset to zero" snap
+            else if (state.animationBuffer.length > 0) {
                 const weights = state.animationBuffer[state.animationBuffer.length - 1];
                 const bs = {};
                 BLENDSHAPE_NAMES.forEach((name, i) => bs[name] = weights[i]);
+                updateDebug(weights[24], 0);
                 return bs;
             }
         }
@@ -361,26 +386,22 @@ function queueAudioChunk(audioBuffer) {
     const source = state.audioContext.createBufferSource();
     source.buffer = audioBuffer;
 
-    // Track duration and store source
     const chunkDuration = audioBuffer.duration;
     const chunkInfo = { source, duration: chunkDuration };
     state.audioQueue.push(chunkInfo);
     state.queuedDuration += chunkDuration;
 
-    // 1. Check if we need to start prerolling (Cold Start)
     if (!state.audioPlaying && !state.isPrerolling) {
         state.isPrerolling = true;
         log(`Buffering... (Target: ${state.PREROLL_DURATION_SEC}s)`, 'warn');
     }
 
-    // 2. If Prerolling, check if threshold is met
     if (state.isPrerolling) {
         log(`Buffer: ${state.queuedDuration.toFixed(2)}s / ${state.PREROLL_DURATION_SEC}s`);
         if (state.queuedDuration >= state.PREROLL_DURATION_SEC) {
             startPlaybackQueue();
         }
     } else {
-        // 3. Already playing? Schedule immediately.
         scheduleNextChunk();
     }
 }
@@ -388,14 +409,9 @@ function queueAudioChunk(audioBuffer) {
 function startPlaybackQueue() {
     state.isPrerolling = false;
     state.audioPlaying = true;
-
-    // Set start time slightly in the future (0.1s) for browser stability
     state.nextStartTime = state.audioContext.currentTime + 0.1;
     state.streamStartTime = state.nextStartTime;
-
     log("Preroll Complete. Playing.", 'success');
-
-    // Flush the queue
     while(state.audioQueue.length > 0) {
         scheduleNextChunk();
     }
@@ -403,56 +419,39 @@ function startPlaybackQueue() {
 
 function scheduleNextChunk() {
     if (state.audioQueue.length === 0) return;
-
     const info = state.audioQueue.shift();
-
-    // 1. Create a GainNode for "De-clicking" envelope
     const gainNode = state.audioContext.createGain();
-
-    // 2. Connect Source -> Gain -> Destination
     info.source.connect(gainNode);
     gainNode.connect(state.audioContext.destination);
 
-    // 3. Calculate timing
     let scheduleTime = Math.max(state.audioContext.currentTime, state.nextStartTime);
-
-    // 4. Apply Micro-Fades (3ms) to prevent popping
     const FADE_DURATION = 0.003;
 
-    // Reset gain to 0
     gainNode.gain.setValueAtTime(0, scheduleTime);
-    // Fade In
     gainNode.gain.linearRampToValueAtTime(1, scheduleTime + FADE_DURATION);
-    // Fade Out
     gainNode.gain.setValueAtTime(1, scheduleTime + info.duration - FADE_DURATION);
     gainNode.gain.linearRampToValueAtTime(0, scheduleTime + info.duration);
 
-    // 5. Start Playback
     info.source.start(scheduleTime);
-
     state.nextStartTime = scheduleTime + info.duration;
     state.queuedDuration = Math.max(0, state.queuedDuration - info.duration);
 
     info.source.onended = () => {
         info.source.disconnect();
         gainNode.disconnect();
-
         if (state.audioQueue.length === 0 && state.audioContext.currentTime >= state.nextStartTime - 0.1) {
              state.audioPlaying = false;
              state.queuedDuration = 0;
              log("Stream Finished", 'info');
              document.getElementById('btnStream').disabled = false;
              document.getElementById('btnStream').innerText = "Start Live Stream";
-
              feedWorker(null, true);
              updateDebug(0, 0, 0);
         }
     };
 }
 
-// --- MODEL FEEDER (WITH PADDING) ---
 function feedWorker(newPcmData, isFlush = false) {
-    // 1. Append data
     if (newPcmData) {
         const totalLen = state.pcmAccumulator.length + newPcmData.length;
         const temp = new Float32Array(totalLen);
@@ -460,19 +459,14 @@ function feedWorker(newPcmData, isFlush = false) {
         temp.set(newPcmData, state.pcmAccumulator.length);
         state.pcmAccumulator = temp;
     }
-
-    // 2. Process strictly in 16k chunks
     const CHUNK = CONFIG.chunkSize;
     while (state.pcmAccumulator.length >= CHUNK) {
         const slice = state.pcmAccumulator.slice(0, CHUNK);
         state.worker.postMessage({ type: 'INFER', payload: slice });
         state.pcmAccumulator = state.pcmAccumulator.slice(CHUNK);
     }
-
-    // 3. Flush leftover if requested (WITH PADDING)
     if (isFlush && state.pcmAccumulator.length > 0) {
         log(`Flushing final buffer: ${state.pcmAccumulator.length} samples`, 'info');
-
         if (state.pcmAccumulator.length < CHUNK) {
             const padded = new Float32Array(CHUNK);
             padded.set(state.pcmAccumulator);
@@ -480,42 +474,32 @@ function feedWorker(newPcmData, isFlush = false) {
         } else {
              state.worker.postMessage({ type: 'INFER', payload: state.pcmAccumulator });
         }
-
         state.pcmAccumulator = new Float32Array(0);
     }
 }
 
 async function processStream(reader) {
     let leftover = new Uint8Array(0);
-
     while (true) {
         const { done, value } = await reader.read();
-
         if (done) {
             if (state.isPrerolling) {
                 log(`Stream ended (Total: ${state.queuedDuration.toFixed(2)}s). Forcing playback.`, 'warn');
                 startPlaybackQueue();
             }
-
             feedWorker(null, true);
             break;
         }
-
         const combined = new Uint8Array(leftover.length + value.length);
         combined.set(leftover);
         combined.set(value, leftover.length);
-
         try {
             const tempBuffer = combined.slice(0).buffer;
             const audioBuffer = await state.audioContext.decodeAudioData(tempBuffer);
-
             const pcmData = audioBuffer.getChannelData(0);
-
             feedWorker(pcmData, false);
             queueAudioChunk(audioBuffer);
-
             leftover = new Uint8Array(0);
-
         } catch (e) {
             leftover = combined;
         }
@@ -553,12 +537,9 @@ document.getElementById('btnStream').addEventListener('click', async () => {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ text, voice_id: voiceId })
         });
-
         if (!response.ok) throw new Error("Stream connection failed");
-
         const reader = response.body.getReader();
         await processStream(reader);
-
     } catch (e) {
         log("Stream Error: " + e.message, 'error');
         btn.disabled = false;
@@ -566,7 +547,6 @@ document.getElementById('btnStream').addEventListener('click', async () => {
     }
 });
 
-// --- CLONING & AVATAR LOGIC ---
 document.getElementById('btnClone').addEventListener('click', async () => {
     const file = document.getElementById('cloneAudioInput').files[0];
     if (!file) return log("No file selected", 'error');
