@@ -18,8 +18,8 @@ const PORT = 3001;
 const WAVESPEED_API_KEY = process.env.WAVESPEED_API_KEY;
 
 // --- EXTERNAL ORCHESTRATOR CONFIG ---
-const ORCHESTRATOR_URL = "http://184.105.87.177:9000";
-const ORCHESTRATOR_API_KEY = "dev-key-change-in-production";
+const ORCHESTRATOR_URL = process.env.ORCHESTRATOR_URL;
+const ORCHESTRATOR_API_KEY = process.env.ORCHESTRATOR_API_KEY;
 
 if (!WAVESPEED_API_KEY) {
     console.warn("⚠️ WARNING: WAVESPEED_API_KEY is missing in .env file.");
