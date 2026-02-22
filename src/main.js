@@ -549,18 +549,47 @@ document.getElementById('btnStream').addEventListener('click', async () => {
 
 document.getElementById('btnClone').addEventListener('click', async () => {
     const file = document.getElementById('cloneAudioInput').files[0];
-    if (!file) return log("No file selected", 'error');
-    const formData = new FormData(); formData.append('audio_sample', file);
+    if (!file) return log("No audio file selected", 'error');
+
+    const btn = document.getElementById('btnClone');
+    const statusDiv = document.getElementById('cloneStatus');
+    const progressSpan = document.getElementById('cloneProgress');
+
+    // --- Start Loading State ---
+    btn.disabled = true;
+    btn.innerText = "Cloning...";
+    statusDiv.classList.remove('hidden');
+    progressSpan.innerText = "Uploading & cloning voice... (Please wait)";
+    progressSpan.className = "text-yellow-400";
+
+    log("Starting voice cloning process...", 'info');
+
+    const formData = new FormData();
+    formData.append('audio_sample', file);
+
     try {
         const res = await fetch(`${CONFIG.uploadServer}/api/clone-voice`, { method: 'POST', body: formData });
         const json = await res.json();
+
         if(json.success) {
+            // --- Success State ---
             document.getElementById('voiceIdInput').value = json.voice_id;
-            document.getElementById('clonedVoiceId').innerText = json.voice_id;
-            document.getElementById('cloneStatus').classList.remove('hidden');
-            log("Voice Cloned", 'success');
+            progressSpan.innerText = `Success! ID: ${json.voice_id}`;
+            progressSpan.className = "font-mono text-green-400 select-all";
+            log("Voice Cloned successfully", 'success');
+        } else {
+            throw new Error(json.error || "Cloning failed");
         }
-    } catch(e) { log("Clone Failed", 'error'); }
+    } catch(e) {
+        // --- Error State ---
+        progressSpan.innerText = "Cloning Failed";
+        progressSpan.className = "text-red-400";
+        log("Clone Failed: " + e.message, 'error');
+    } finally {
+        // --- Restore Button ---
+        btn.disabled = false;
+        btn.innerText = "Upload & Clone Voice";
+    }
 });
 
 document.getElementById('avatarSelect').addEventListener('change', async (e) => {
@@ -578,6 +607,66 @@ document.getElementById('avatarInput').addEventListener('change', async (e) => {
         document.getElementById('avatarSelect').querySelector('option[value="custom"]').innerText = `Custom: ${file.name}`;
         document.getElementById('avatarSelect').value = 'custom';
         await reloadRenderer();
+    }
+});
+
+// --- NEW FACE RECONSTRUCTION LOGIC ---
+document.getElementById('btnReconstruct').addEventListener('click', async () => {
+    const file = document.getElementById('faceImageInput').files[0];
+    if (!file) return log("No face image selected for reconstruction", 'error');
+
+    const btn = document.getElementById('btnReconstruct');
+    const statusDiv = document.getElementById('reconstructStatus');
+    const progressSpan = document.getElementById('reconstructProgress');
+
+    btn.disabled = true;
+    btn.innerText = "Reconstructing...";
+    statusDiv.classList.remove('hidden');
+    progressSpan.innerText = "Reconstructing face... (May take several minutes)";
+    progressSpan.className = "text-yellow-400";
+
+    log("Starting face reconstruction process. Please wait...", 'warn');
+
+    const formData = new FormData();
+    formData.append('face_image', file);
+
+    try {
+        const res = await fetch(`${CONFIG.uploadServer}/api/reconstruct-face`, {
+            method: 'POST',
+            body: formData
+        });
+
+        const json = await res.json();
+        if(json.success) {
+            progressSpan.innerText = `Success! Asset ID: ${json.asset_id}`;
+            progressSpan.className = "text-green-400 select-all";
+            log(`Face reconstructed and ZIP downloaded. Loading into renderer...`, 'success');
+
+            // Update avatar path to point to the newly downloaded ZIP
+            state.avatarPath = `${CONFIG.uploadServer}${json.path}`;
+
+            // Add a temporary option to the dropdown to show the active reconstructed avatar
+            const select = document.getElementById('avatarSelect');
+            let option = select.querySelector('option[value="reconstructed"]');
+            if (!option) {
+                option = document.createElement('option');
+                option.value = 'reconstructed';
+                select.appendChild(option);
+            }
+            option.innerText = `Reconstructed: ${json.filename}`;
+            select.value = 'reconstructed';
+
+            await reloadRenderer();
+        } else {
+            throw new Error(json.error || "Unknown reconstruction error");
+        }
+    } catch(e) {
+        progressSpan.innerText = "Reconstruction Failed";
+        progressSpan.className = "text-red-400";
+        log("Face Reconstruction Failed: " + e.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.innerText = "Reconstruct Face";
     }
 });
 

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 import fs from 'fs';
 import axios from 'axios';
 import dotenv from 'dotenv';
+import FormData from 'form-data';
 
 dotenv.config();
 
@@ -15,6 +16,10 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = 3001;
 const WAVESPEED_API_KEY = process.env.WAVESPEED_API_KEY;
+
+// --- EXTERNAL ORCHESTRATOR CONFIG ---
+const ORCHESTRATOR_URL = "http://184.105.87.177:9000";
+const ORCHESTRATOR_API_KEY = "dev-key-change-in-production";
 
 if (!WAVESPEED_API_KEY) {
     console.warn("⚠️ WARNING: WAVESPEED_API_KEY is missing in .env file.");
@@ -47,7 +52,85 @@ app.post('/upload-avatar', upload.single('avatar'), (req, res) => {
     res.json({ success: true, path: `/asset/arkit/custom/${req.file.filename}`, filename: req.file.filename });
 });
 
-// 2. Clone Voice
+// 2. Face Reconstruction Integration
+app.post('/api/reconstruct-face', upload.single('face_image'), async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
+
+    console.log(`[Reconstruct] Starting face reconstruction for: ${req.file.filename}`);
+
+    try {
+        // Step A: Forward image to external API to get asset_id
+        const formData = new FormData();
+
+        // FIX: Explicitly pass the contentType and filename. Python APIs often reject
+        // multipart files that don't declare their mime type.
+        formData.append('file', fs.createReadStream(req.file.path), {
+            filename: req.file.originalname,
+            contentType: req.file.mimetype
+        });
+
+        console.log(`[Reconstruct] Uploading to orchestrator at ${ORCHESTRATOR_URL}...`);
+        const uploadResponse = await axios.post(`${ORCHESTRATOR_URL}/assets/face`, formData, {
+            headers: {
+                ...formData.getHeaders(),
+                "X-Api-Key": ORCHESTRATOR_API_KEY
+            },
+            maxBodyLength: Infinity, // Important for larger files
+            timeout: 600000 // 10 minutes timeout for the LAM pipeline
+        });
+
+        const assetId = uploadResponse.data.asset_id;
+        if (!assetId) throw new Error("No asset_id returned from Orchestrator API");
+
+        console.log(`[Reconstruct] Success! Asset ID: ${assetId}. Downloading ZIP...`);
+
+        // Step B: Download the zipped assets from the API
+        const zipResponse = await axios.get(`${ORCHESTRATOR_URL}/assets/face/${assetId}/download`, {
+            headers: { "X-Api-Key": ORCHESTRATOR_API_KEY },
+            responseType: 'stream',
+            timeout: 600000
+        });
+
+        const zipFilename = `reconstructed_${assetId}.zip`;
+        const localZipPath = path.join(__dirname, 'public', 'asset', 'arkit', 'custom', zipFilename);
+        const writer = fs.createWriteStream(localZipPath);
+
+        zipResponse.data.pipe(writer);
+
+        await new Promise((resolve, reject) => {
+            writer.on('finish', resolve);
+            writer.on('error', reject);
+        });
+
+        console.log(`[Reconstruct] ZIP downloaded successfully to ${localZipPath}`);
+
+        // Step C: Send the local URL back to the frontend
+        res.json({
+            success: true,
+            path: `/asset/arkit/custom/${zipFilename}`,
+            filename: zipFilename,
+            asset_id: assetId
+        });
+
+    } catch (error) {
+        let errorMsg = error.message;
+
+        // FIX: Unpack the actual 422 validation response from the Python API
+        if (error.response && error.response.data) {
+             let details = error.response.data;
+             // If it's an object/array (like FastAPI's {"detail": [...]}), stringify it for the logs
+             if (typeof details === 'object') {
+                 details = JSON.stringify(details);
+             }
+             errorMsg = `External API Error. Status: ${error.response.status}. Details: ${details}`;
+        }
+
+        console.error("[Reconstruct] Error:", errorMsg);
+        res.status(500).json({ error: errorMsg });
+    }
+});
+
+// 3. Clone Voice
 async function pollWaveSpeedResult(requestId) {
     const url = `https://api.wavespeed.ai/api/v3/predictions/${requestId}/result`;
     const headers = { "Authorization": `Bearer ${WAVESPEED_API_KEY}` };
@@ -85,7 +168,7 @@ app.post('/api/clone-voice', upload.single('audio_sample'), async (req, res) => 
     }
 });
 
-// 3. Streaming TTS Endpoint (With Duplicate Fix)
+// 4. Streaming TTS Endpoint (With Duplicate Fix)
 app.post('/api/tts-stream', async (req, res) => {
     try {
         const { text, voice_id } = req.body;
@@ -128,19 +211,15 @@ app.post('/api/tts-stream', async (req, res) => {
 
                     try {
                         const json = JSON.parse(jsonStr);
-                        // MiniMax/WaveSpeed often wraps status inside 'data' object, or at root
                         let status = json.status;
                         if (json.data && json.data.status !== undefined) {
                             status = json.data.status;
                         }
 
-                        // If status is 2, it's the final summary packet which might contain full audio.
-                        // We skip it to avoid duplication.
                         if (status === 2) {
                             console.log(" [Stream] Skipping Final Summary Packet (Status 2)");
                             continue;
                         }
-                        // -----------------------------------------------
 
                         let hexAudio = null;
                         if (json.data && json.data.audio) {
